@@ -1,4 +1,4 @@
-# ipsw-to-symbols
+# ipsw-get-symbols
 
 从 iOS IPSW 固件中提取 `dyld_shared_cache` 系统符号文件，用于逆向工程和安全研究。
 
