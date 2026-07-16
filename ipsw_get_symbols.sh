@@ -11,7 +11,8 @@ die() { echo "❌ $1"; exit 1; }
 
 print_usage() {
     echo "用法:"
-    echo "  $SCRIPT_NAME <iPhoneXX_X_X_X_Restore.ipsw>                # 从本地 .ipsw 文件提取符号"
+    echo "  $SCRIPT_NAME <*.ipsw>                                     # 从本地 .ipsw 文件提取符号"
+    echo "  $SCRIPT_NAME <目录>                                       # 从已解压目录自动提取符号"
     echo "  $SCRIPT_NAME <dyld_shared_cache_arm64e> -v <version>      # 从 dyld 文件直接提取符号"
     echo "  $SCRIPT_NAME -r <url>                                     # 从远程 URL 直接提取符号"
     echo "  $SCRIPT_NAME -d <device> <-v <version> | -b <build>>      # 下载固件并提取符号"
@@ -19,7 +20,7 @@ print_usage() {
     echo ""
     echo "参数:"
     echo "  -v, --version   iOS 版本 (如 12.3.1)"
-    echo "  -d, --device    设备 (如 iPhone11,2)"
+    echo "  -d, --device    设备 (如 iPhone11,2 / iPad_Pro_HFR)"
     echo "  -b, --build     Build ID (如 16F203)"
     echo "  -l, --list      列出该版本所有固件地址"
 }
@@ -49,9 +50,9 @@ cleanup_download() {
 
 # 从目录中查找 dyld 并提取符号
 find_and_extract() {
-    local search_dir="$1" version="$2" build="$3" pattern="${4:-*}"
-    local dsc_dir=$(find "./${search_dir}" -type d -name "${build}__${pattern}" | head -n 1)
-    [ -z "$dsc_dir" ] && die "无法找到 dyld 目录: ${search_dir}/${build}__${pattern}"
+    local search_dir="$1" version="$2" build="$3"
+    local dsc_dir=$(find "./${search_dir}" -type d -name "${build}__*" | head -n 1)
+    [ -z "$dsc_dir" ] && die "无法找到 dyld 目录: ${search_dir}/${build}__*"
     extract_symbols "$(find_dsc "$dsc_dir")" "$version" "$build"
 }
 
@@ -99,8 +100,11 @@ extract_symbols() {
     echo "====================================="
     echo ""
 
-    echo "🔧 正在提取系统符号..."
-    run_ipsw dyld extract "$dsc_file" --all --objc -o "$symbol_dir"
+    echo "🔧 正在提取系统符号 (含 ObjC)..."
+    if ! run_ipsw dyld extract "$dsc_file" --all --objc -o "$symbol_dir"; then
+        echo "⚠️ 含 ObjC 提取失败，尝试不含 ObjC..."
+        run_ipsw dyld extract "$dsc_file" --all -o "$symbol_dir"
+    fi
 
     echo "🚧 修复损坏的Mach-O load commands..."
     fix_macho "$symbol_dir"
@@ -123,7 +127,7 @@ extract_from_ipsw() {
     echo "🔍 提取 dyld_shared_cache..."
     run_ipsw extract --dyld "$ipsw_file" -o "$dl_dir"
 
-    find_and_extract "$dl_dir" "$ios_ver" "$build_code" "iPhone*"
+    find_and_extract "$dl_dir" "$ios_ver" "$build_code"
 }
 
 # 下载固件 -> 查找 dyld -> 提取符号
@@ -133,7 +137,7 @@ download_and_extract() {
 
     echo "⬇️ 正在下载固件并提取 dyld..."
     local dl_log=$(mktemp)
-    local -a dl_args=(-y --dyld -d "$device" -o "$dl_dir" --skip-all)
+    local -a dl_args=(-y --dyld -o "$dl_dir" --skip-all)
     [ -n "$version" ] && dl_args+=(-v "$version") || dl_args+=(-b "$build")
     echo "$ ipsw download ipsw ${dl_args[*]}"
     ipsw download ipsw "${dl_args[@]}" 2>&1 | tee "$dl_log" || true
@@ -147,7 +151,7 @@ download_and_extract() {
         rm -f "$dl_log"
         echo ""
         echo "⚠️ 该文件不支持分段下载，切换为完整下载模式..."
-        local -a fb_args=(-y -d "$device" -o . --skip-all)
+        local -a fb_args=(-y -o . --skip-all)
         [ -n "$version" ] && fb_args+=(-v "$version") || fb_args+=(-b "$build")
         run_ipsw download ipsw "${fb_args[@]}"
 
@@ -165,13 +169,18 @@ download_and_extract() {
     cleanup_download "$version" "$build" "$dl_dir"
 }
 
-# 从 URL 解析 device、version、build
+# 从 URL/文件名解析 device、version、build
 # 格式: *{device}_{version}_{build}_Restore.ipsw
+# 支持: iPhone11,2_12.3.1_16F203_Restore.ipsw
+#      iPad_Pro_HFR_17.7.1_21H216_Restore.ipsw
+#      iPad17,1,iPad17,2_27.0_24A5380l_Restore.ipsw
 parse_url_info() {
     local filename=$(basename "$1")
-    parsed_device=$(echo "$filename" | grep -oE 'iPhone[0-9]+,[0-9]+' | head -1)
-    parsed_version=$(echo "$filename" | sed -nE 's/.*iPhone[0-9]+,[0-9]+_([0-9]+\.[0-9]+(\.[0-9]+)?)_.*/\1/p')
-    parsed_build=$(echo "$filename" | sed -nE 's/.*_([A-Z0-9]+)_Restore\..*/\1/p')
+    local base="${filename%_Restore.ipsw}"
+    parsed_build="${base##*_}"
+    local rest="${base%_*}"
+    parsed_version="${rest##*_}"
+    parsed_device="${rest%_*}"
 }
 
 # ==================== Mach-O 修复脚本 ====================
@@ -257,9 +266,15 @@ while [ $# -gt 0 ]; do
     esac
 done
 
-DSC_FILE="" IPSW_FILE=""
+DSC_FILE="" IPSW_FILE="" SEARCH_DIR=""
 if [ -n "$POSITIONAL" ]; then
-    [[ "$POSITIONAL" == *"dyld_shared_cache_arm64"* ]] && DSC_FILE="$POSITIONAL" || IPSW_FILE="$POSITIONAL"
+    if [[ "$POSITIONAL" == *"dyld_shared_cache_arm64"* ]]; then
+        DSC_FILE="$POSITIONAL"
+    elif [ -d "$POSITIONAL" ]; then
+        SEARCH_DIR="$POSITIONAL"
+    else
+        IPSW_FILE="$POSITIONAL"
+    fi
 fi
 
 # ==================== 模式 A: 本地 .ipsw 文件 ====================
@@ -267,8 +282,9 @@ fi
 if [ -n "$IPSW_FILE" ]; then
     [ ! -f "$IPSW_FILE" ] && die "文件不存在: $IPSW_FILE"
 
-    ios_ver=$(echo "$IPSW_FILE" | cut -d'_' -f2)
-    build_code=$(echo "$IPSW_FILE" | cut -d'_' -f3 | cut -d'-' -f1)
+    parse_url_info "$IPSW_FILE"
+    ios_ver="$parsed_version"
+    build_code="$parsed_build"
 
     echo "====================================="
     echo "📦 IPSW 文件: $IPSW_FILE"
@@ -287,6 +303,27 @@ if [ -n "$DSC_FILE" ]; then
     [ ! -f "$DSC_FILE" ] && die "文件不存在: $DSC_FILE"
     [ -z "$VERSION" ] && die "指定 dyld 文件时必须提供 -v/--version 参数"
     extract_symbols "$DSC_FILE" "$VERSION" "${BUILD:-unknown}"
+    exit 0
+fi
+
+# ==================== 模式 A3: 目录搜索 ====================
+
+if [ -n "$SEARCH_DIR" ]; then
+    SEARCH_DIR="${SEARCH_DIR%/}"
+    build_dir=$(find "$SEARCH_DIR" -maxdepth 1 -type d -name "*__*" | head -n 1)
+    [ -z "$build_dir" ] && die "无法在 $SEARCH_DIR 中找到固件目录 (期望 ${build}__* 格式)"
+
+    build_name=$(basename "$build_dir")
+    build_code="${build_name%%__*}"
+
+    echo "====================================="
+    echo "📁 目录: $SEARCH_DIR"
+    echo "📱 iOS 版本: $SEARCH_DIR"
+    echo "🏗 Build 号: $build_code"
+    echo "====================================="
+    echo ""
+
+    find_and_extract "$SEARCH_DIR" "$SEARCH_DIR" "$build_code"
     exit 0
 fi
 
@@ -319,7 +356,7 @@ if [ "$LIST_MODE" = true ]; then
 
     urls=()
     while IFS= read -r line; do
-        [[ "$line" =~ ^https:// ]] && [[ "$line" == *iPhone* ]] && urls+=("$line")
+        [[ "$line" =~ ^https:// ]] && [[ "$line" == *Restore.ipsw ]] && urls+=("$line")
     done < <(eval "$cmd --urls" 2>/dev/null)
 
     [ ${#urls[@]} -eq 0 ] && die "未找到固件"
@@ -346,7 +383,7 @@ if [ "$LIST_MODE" = true ]; then
     if [ -z "$parsed_device" ] || [ -z "$parsed_version" ] || [ -z "$parsed_build" ]; then
         die "无法从 URL 解析 device/version/build\n   URL: $selected_url"
     fi
-    [[ "$parsed_device" == iPad* ]] && die "请选择 iPhone 设备的固件地址，不要选 iPad"
+
 
     remote_extract "$selected_url" "${VERSION:-$parsed_version}" "$parsed_build"
     exit 0
